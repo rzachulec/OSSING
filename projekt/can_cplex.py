@@ -38,45 +38,14 @@ and persist with  np.savetxt("routing.txt", a_us.reshape(M + 1, -1), fmt="%d").
 import numpy as np
 from docplex.mp.model import Model
 
-
-# =============================================================================
-# NETWORK INSTANCE   — paper Section IV:  two routers, every link 10 MB/s.
-# Generalised to (M clients, S servers) — paper's case is M=2, S=2, L=6.
-# =============================================================================
-
-M = 2   # clients
-N = 2   # objects
-S = 2   # servers
-
-L = M * S + 2                      # = 6 for the M=2, S=2 instance
-L_pub   = 0
-L_back  = M + 1
-def L_cli(u):  return u            # u ∈ {1..M} → link u
-def L_srv(s):  return M + 2 + s    # s ∈ {0..S-1}
-
-bn   = np.ones(N)                           # object sizes  b_n
-Cl   = np.full(L, 10.0)                     # every link at 10 MB/s (paper)
-tau3 = np.zeros(L)                          # no constant link delay
-
-y_min   = 0.1
-y_max   = 10.0
-rho_max = 0.95
-
-# -----------------------------------------------------------------------------
-# Routing  a_us[u, s, l]   u=0 publisher, u=1..M clients
-# -----------------------------------------------------------------------------
-a_us = np.zeros((M + 1, S, L), dtype=int)
-for s_idx in range(S):
-    # publisher path: L_pub → L_back → L_srv(s)
-    a_us[0, s_idx, [L_pub, L_back, L_srv(s_idx)]] = 1
-    # each client path: L_cli(u) → L_back → L_srv(s)
-    for u in range(1, M + 1):
-        a_us[u, s_idx, [L_cli(u), L_back, L_srv(s_idx)]] = 1
-
-# Broadcast across object dimension (routing is independent of the object).
-a = np.zeros((M + 1, N, S, L), dtype=int)
-for n in range(N):
-    a[:, n, :, :] = a_us
+# Network instance is defined in network.py so the solver and the visualiser
+# share a single source of truth.  Edit network.py to switch topologies.
+from network import (
+    M, N, S, L,
+    bn, Cl, tau3,
+    y_min, y_max, rho_max,
+    a,
+)
 
 
 # =============================================================================
