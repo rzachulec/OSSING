@@ -26,13 +26,12 @@ the MIP directly for small instances):
     * τ^(2)_l(load) = 1/(C-load) PWL over load ∈ [0, ρ_max·C_l], dense near C.
     * x_mns · τ^(2)_l           (binary × continuous) linearised via bigM.
 
-Routing matrix  `a_us[u, s, l]` — user→server→link adjacency.  u=0 publisher,
-u=1..M clients.  It is the sole topology input; to load from file replace the
-hand-written block below with e.g.:
-
-      a_us = np.loadtxt("routing.txt", dtype=int).reshape(M + 1, S, L)
-
-and persist with  np.savetxt("routing.txt", a_us.reshape(M + 1, -1), fmt="%d").
+Network instance
+----------------
+All topology parameters (M, N, S, L, routing tensor `a`, link capacities `Cl`,
+object sizes `bn`, constant delays `tau3`, rate bounds) are imported from
+`network.py`, the single source of truth shared with `routing_viz.py`.  To
+run on a different instance, edit `network.py`; no changes here are needed.
 """
 
 import numpy as np
