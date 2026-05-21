@@ -1,443 +1,565 @@
 """
-Two-Level Heuristic Algorithm for CAN Optimization
-====================================================
-Gąsior & Drwal (2012), IEEE/IPSJ SAINT 2012.
+Two-level heuristic for CAN mean-delay minimization based on Section 3 of the
+paper. The algorithm alternates between:
 
-Maximize  Q(x,y) = U(y) - G(x,y) - H(x0)
-  Upper level : rate allocation  →  concave max, solved with SLSQP
-  Lower level : data placement   →  Lagrangian relaxation + subgradient method
+1. upper level: rate allocation for fixed placement/assignment,
+2. lower level: greedy data placement for fixed rates.
 
-Expected result (paper Table II, iteration 1):
-  Placement : Object 1 on Server 1 AND Server 2  (replicated)
-              Object 2 on Server 2 only
-  Q ≈ 73.7
-
-Install: pip install numpy scipy
-Run    : python can_heuristic.py
+The implementation follows the shared project conventions:
+- load instances from JSON via ModelReader
+- expose solve_instance() / solve_file()
+- keep CLI handling in main()
 """
+
+from __future__ import annotations
+
+import argparse
 
 import numpy as np
 import scipy.optimize as opt
 
-# ─────────────────────────────────────────────────────────────────────────────
-# NETWORK PARAMETERS  (Section IV computational example)
-# ─────────────────────────────────────────────────────────────────────────────
-
-M = 2    # clients  (m = 1..M;  m = 0 = publisher)
-N = 2    # data objects
-S = 2    # cache servers
-L = 2    # network links
-
-Bs  = np.array([1.0, 2.0])             # server storage capacities
-bn  = np.array([1.0, 1.0])             # object sizes
-Cl  = np.array([10.0, 10.0])           # link capacities (MB/s)
-kl  = np.array([5.0,  2.0])            # link unit bandwidth cost
-dns = np.array([[0.4, 1.0],            # storage cost  dns[n, s]
-                [0.4, 1.0]])
-w       = 20.0    # logarithmic utility weight ("willingness-to-pay")
-ymn_min =  0.1    # minimum QoS rate
-ymn_max = 10.0    # maximum rate cap
-
-# Routing: server s exclusively uses link s
-# a[m, n, s, l] = 1  iff  s == l   (0-indexed; m=0 → publisher)
-a = np.zeros((M + 1, N, S, L))
-for _m in range(M + 1):
-    for _n in range(N):
-        for _s in range(S):
-            a[_m, _n, _s, _s] = 1
+try:
+    from . import ModelReader
+except ImportError:
+    import ModelReader
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# UTILITY & COST
-# ─────────────────────────────────────────────────────────────────────────────
+DEFAULT_TAU3 = 0.0
+DEFAULT_RATE_EPS = 1e-4
+DEFAULT_QUEUE_EPS = 1e-4
+DEFAULT_MAX_OUTER_ITER = 10
 
-def U(y):    return w * np.log(max(float(y), 1e-12))
-def dU(y):   return w / max(float(y), 1e-12)
 
-def G(x0, xmns, y0, ymn):
-    """Link bandwidth cost G(x,y)."""
-    cost = 0.0
-    for n in range(N):
-        for s in range(S):
+def route_capacity(route_bits, capacities):
+    """Return the tightest link capacity on a route."""
+    used_links = [l for l, bit in enumerate(route_bits) if bit]
+    if not used_links:
+        return 0.0
+    return float(min(capacities[l] for l in used_links))
+
+
+def active_link_loads(instance, x0, xmns, y0, ymn):
+    """Compute link loads for the current active flow set."""
+    loads = np.zeros(instance.L, dtype=float)
+    for n in range(instance.N):
+        for s in range(instance.S):
             if x0[n, s]:
-                cost += np.dot(kl, a[0, n, s, :]) * y0[n, s]
-    for m in range(M):
-        for n in range(N):
-            for s in range(S):
+                loads += instance.A[0, n, s, :] * y0[n, s]
+    for m in range(instance.M):
+        for n in range(instance.N):
+            for s in range(instance.S):
                 if xmns[m, n, s]:
-                    cost += np.dot(kl, a[m+1, n, s, :]) * ymn[m, n]
-    return cost
-
-def H(x0):
-    """Storage cost H(x0)."""
-    return float(np.sum(dns * x0))
-
-def Q_profit(x0, xmns, y0, ymn):
-    """Total profit Q = U − G − H."""
-    util  = sum(U(y0[n, s]) for n in range(N) for s in range(S) if x0[n, s])
-    util += sum(U(ymn[m, n]) for m in range(M) for n in range(N))
-    return util - G(x0, xmns, y0, ymn) - H(x0)
-
-def is_feasible(x0, xmns):
-    if any(x0[n, :].sum() < 1 for n in range(N)):                 return False
-    if any(xmns[m, n, :].sum() != 1
-           for m in range(M) for n in range(N)):                   return False
-    if np.any(xmns > x0[np.newaxis, :, :]):                       return False
-    if any((x0[:, s] * bn).sum() > Bs[s] for s in range(S)):     return False
-    return True
+                    loads += instance.A[m + 1, n, s, :] * ymn[m, n]
+    return loads
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# UPPER LEVEL: Rate Allocation  (Section III-A)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def solve_rate_allocation(x0, xmns):
-    """
-    Given fixed placement x0[N,S] and assignment xmns[M,N,S], solve:
-        max_y  U(y) − G(x', y)
-    Uses SLSQP with analytic gradient.
-    Returns y0[N,S], ymn[M,N], objective_value, converged.
-    """
-    pub_pairs  = [(n, s) for n in range(N) for s in range(S) if x0[n, s]]
-    cli_assign = {(m, n): next(s for s in range(S) if xmns[m, n, s])
-                  for m in range(M) for n in range(N)}
-
-    n_pub  = len(pub_pairs)
-    n_vars = n_pub + M * N
-
-    pi  = lambda i: i
-    ci  = lambda m, n: n_pub + m * N + n
-
-    def link_loads(y):
-        ld = np.zeros(L)
-        for i, (n, s) in enumerate(pub_pairs):
-            ld += a[0, n, s, :] * y[pi(i)]
-        for (m, n), s in cli_assign.items():
-            ld += a[m+1, n, s, :] * y[ci(m, n)]
-        return ld
-
-    def neg_obj(y):
-        util  = sum(U(y[pi(i)])    for i in range(n_pub))
-        util += sum(U(y[ci(m, n)]) for m in range(M) for n in range(N))
-        return -(util - np.dot(kl, link_loads(y)))
-
-    def neg_grad(y):
-        g = np.zeros(n_vars)
-        for i, (n, s) in enumerate(pub_pairs):
-            g[pi(i)]    = -(dU(y[pi(i)])    - np.dot(kl, a[0,   n, s, :]))
-        for (m, n), s in cli_assign.items():
-            g[ci(m, n)] = -(dU(y[ci(m, n)]) - np.dot(kl, a[m+1, n, s, :]))
-        return g
-
-    constraints = [{'type': 'ineq',
-                    'fun': lambda y, l=l: Cl[l] - link_loads(y)[l]}
-                   for l in range(L)]
-    bounds  = [(ymn_min, ymn_max)] * n_vars
-    y_init  = np.full(n_vars, ymn_min * 2.0)
-
-    res = opt.minimize(neg_obj, y_init, jac=neg_grad, method='SLSQP',
-                       bounds=bounds, constraints=constraints,
-                       options={'ftol': 1e-12, 'maxiter': 5000})
-
-    y0_out  = np.zeros((N, S))
-    ymn_out = np.zeros((M, N))
-    for i, (n, s) in enumerate(pub_pairs):
-        y0_out[n, s]  = res.x[pi(i)]
-    for m in range(M):
-        for n in range(N):
-            ymn_out[m, n] = res.x[ci(m, n)]
-
-    return y0_out, ymn_out, -res.fun, res.success
+def flow_delay(instance, m, n, s, flow_rate, link_loads, tau3):
+    """Evaluate tau_mns for one routed flow under the given link loads."""
+    route = instance.A[m, n, s, :]
+    push = instance.bn[n] / flow_rate
+    queue = sum(
+        route[l] * (1.0 / (instance.Cl[l] - link_loads[l]) + tau3)
+        for l in range(instance.L)
+    )
+    return float(push + queue)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LOWER LEVEL: Data Placement  (Section III-B)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _knapsack(values, sizes, capacity):
-    """
-    0-1 knapsack: maximise sum(values*x) s.t. sum(sizes*x) <= capacity.
-    Empty selection has value 0; negative-value items are never chosen.
-    """
-    cap = int(round(capacity))
-    n   = len(values)
-    dp  = np.full(cap + 1, -np.inf);  dp[0] = 0.0
-    sel = [[] for _ in range(cap + 1)]
-    for i in range(n):
-        sz = int(round(sizes[i]))
-        for c in range(cap, sz - 1, -1):
-            v = dp[c - sz] + values[i]
-            if v > dp[c]:
-                dp[c] = v
-                sel[c] = sel[c - sz] + [i]
-    best = int(np.argmax(dp))
-    x = np.zeros(n, dtype=int)
-    for i in sel[best]:
-        x[i] = 1
-    return x
+def total_delay(instance, x0, xmns, y0, ymn, tau3):
+    """Evaluate the paper objective Q(x, y)."""
+    loads = active_link_loads(instance, x0, xmns, y0, ymn)
+    total = 0.0
+    for n in range(instance.N):
+        for s in range(instance.S):
+            if x0[n, s]:
+                total += flow_delay(instance, 0, n, s, y0[n, s], loads, tau3)
+    for m in range(instance.M):
+        for n in range(instance.N):
+            for s in range(instance.S):
+                if xmns[m, n, s]:
+                    total += flow_delay(instance, m + 1, n, s, ymn[m, n], loads, tau3)
+    return float(total)
 
 
-def _capacity_aware_enforce(x0, y0):
-    """
-    Enforce constraint (1): every object placed at least once.
-    FIXED: respects server storage capacities when choosing placement server.
-    """
-    used = np.array([(x0[:, s] * bn).sum() for s in range(S)])
-    for n in range(N):
-        if x0[n, :].sum() == 0:
-            candidates = [
-                (dns[n, s] + np.dot(kl, a[0, n, s, :]) * y0[n, s], s)
-                for s in range(S) if used[s] + bn[n] <= Bs[s]
-            ]
-            if not candidates:
-                candidates = [(dns[n, s], s) for s in range(S)]
-            _, best_s = min(candidates)
-            x0[n, best_s] = 1
-            used[best_s] += bn[n]
-    return x0
+def build_route_caps(instance):
+    """Precompute y_mns,max for all flows."""
+    pub_caps = {
+        (n, s): route_capacity(instance.A[0, n, s, :], instance.Cl)
+        for n in range(instance.N)
+        for s in range(instance.S)
+    }
+    cli_caps = {
+        (m, n, s): route_capacity(instance.A[m + 1, n, s, :], instance.Cl)
+        for m in range(instance.M)
+        for n in range(instance.N)
+        for s in range(instance.S)
+    }
+    return pub_caps, cli_caps
 
 
-def _greedy_assign(x0):
-    """Assign each client m to the cheapest server that holds object n."""
-    xmns = np.zeros((M, N, S), dtype=int)
-    for m in range(M):
-        for n in range(N):
-            available = [s for s in range(S) if x0[n, s]] or list(range(S))
-            best_s = min(available, key=lambda s: np.dot(kl, a[m+1, n, s, :]))
+def greedy_assign_from_placement(instance, x0, tau_cost):
+    """For each client/object, choose the cheapest open server."""
+    xmns = np.zeros((instance.M, instance.N, instance.S), dtype=int)
+    for m in range(instance.M):
+        for n in range(instance.N):
+            open_servers = [s for s in range(instance.S) if x0[n, s]]
+            best_s = min(open_servers, key=lambda s: tau_cost[m + 1, n, s])
             xmns[m, n, best_s] = 1
     return xmns
 
 
-def solve_data_placement(y0_ref, ymn_ref, max_iter=500, eps=1e-6, kappa=1.5):
+def initial_assignment(instance):
+    """Build a simple feasible initial solution."""
+    x0 = np.zeros((instance.N, instance.S), dtype=int)
+    xmns = np.zeros((instance.M, instance.N, instance.S), dtype=int)
+
+    for n in range(instance.N):
+        x0[n, 0] = 1
+
+    for m in range(instance.M):
+        for n in range(instance.N):
+            xmns[m, n, 0] = 1
+
+    return x0, xmns
+
+
+def solve_rate_allocation(
+    instance,
+    x0,
+    xmns,
+    pub_caps,
+    cli_caps,
+    tau3=DEFAULT_TAU3,
+    rate_eps=DEFAULT_RATE_EPS,
+    queue_eps=DEFAULT_QUEUE_EPS,
+):
+    """Solve the upper-level problem from Section 3.1 for fixed x."""
+    pub_pairs = [(n, s) for n in range(instance.N) for s in range(instance.S) if x0[n, s]]
+    cli_pairs = [
+        (m, n, next(s for s in range(instance.S) if xmns[m, n, s]))
+        for m in range(instance.M)
+        for n in range(instance.N)
+    ]
+
+    n_pub = len(pub_pairs)
+    n_cli = len(cli_pairs)
+
+    pub_cap_list = [pub_caps[n, s] for (n, s) in pub_pairs]
+    cli_cap_list = [cli_caps[m, n, s] for (m, n, s) in cli_pairs]
+
+    def pub_index(i):
+        return i
+
+    def cli_index(i):
+        return n_pub + i
+
+    def unpack(y):
+        y0 = np.zeros((instance.N, instance.S), dtype=float)
+        ymn = np.zeros((instance.M, instance.N), dtype=float)
+        for i, (n, s) in enumerate(pub_pairs):
+            y0[n, s] = y[pub_index(i)]
+        for i, (m, n, _s) in enumerate(cli_pairs):
+            ymn[m, n] = y[cli_index(i)]
+        return y0, ymn
+
+    def objective(y):
+        y0, ymn = unpack(y)
+        loads = active_link_loads(instance, x0, xmns, y0, ymn)
+        if np.any(loads >= instance.Cl - queue_eps):
+            overflow = np.maximum(0.0, loads - (instance.Cl - queue_eps))
+            return 1e9 + 1e6 * float(np.sum(overflow))
+        return total_delay(instance, x0, xmns, y0, ymn, tau3)
+
+    def link_loads_from_vector(y):
+        y0, ymn = unpack(y)
+        return active_link_loads(instance, x0, xmns, y0, ymn)
+
+    constraints = [
+        {
+            "type": "ineq",
+            "fun": lambda y, l=l: instance.Cl[l] - queue_eps - link_loads_from_vector(y)[l],
+        }
+        for l in range(instance.L)
+    ]
+    bounds = (
+        [(rate_eps, cap) for cap in pub_cap_list]
+        + [(rate_eps, cap) for cap in cli_cap_list]
+    )
+    y_upper = np.array([hi for _lo, hi in bounds], dtype=float)
+    upper_loads = link_loads_from_vector(y_upper)
+    scale = 1.0
+    positive_loads = upper_loads > 0.0
+    if np.any(positive_loads):
+        scale = min(
+            1.0,
+            float(
+                np.min((instance.Cl[positive_loads] - queue_eps) / upper_loads[positive_loads])
+            ),
+        )
+    y_init = np.maximum(
+        np.array([lo for lo, _hi in bounds], dtype=float),
+        0.9 * scale * y_upper,
+    )
+
+    res = opt.minimize(
+        objective,
+        y_init,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints,
+        options={"ftol": 1e-10, "maxiter": 3000},
+    )
+
+    y0_out, ymn_out = unpack(res.x)
+    return y0_out, ymn_out, float(res.fun), bool(res.success)
+
+
+def build_tau_cost(instance, x_prev, y0_prev, ymn_prev, pub_caps, cli_caps, tau3):
+    """Build the linearized tau-bar costs used by the lower-level problem.
+
+    The previous placement x_prev defines the queueing state. Previously active
+    flows use their solved rates; inactive flows use y_max as described in the
+    paper.
     """
-    Given fixed rates y0_ref[N,S] and ymn_ref[M,N] from upper level, solve:
-        min_{x}  G(x, y') + H(x0)
-    via Lagrangian relaxation + subgradient (Algorithm 1 in paper).
+    x0_prev, xmns_prev = x_prev
+    y0_aug = np.zeros((instance.N, instance.S), dtype=float)
+    ymn_aug = np.zeros((instance.M, instance.N, instance.S), dtype=float)
 
-    KEY: Each server's knapsack runs independently, so objects CAN be
-    selected by multiple servers simultaneously (replication supported).
+    for n in range(instance.N):
+        for s in range(instance.S):
+            y0_aug[n, s] = y0_prev[n, s] if x0_prev[n, s] else pub_caps[n, s]
+
+    for m in range(instance.M):
+        for n in range(instance.N):
+            for s in range(instance.S):
+                if xmns_prev[m, n, s]:
+                    ymn_aug[m, n, s] = ymn_prev[m, n]
+                else:
+                    ymn_aug[m, n, s] = cli_caps[m, n, s]
+
+    loads = np.zeros(instance.L, dtype=float)
+    for n in range(instance.N):
+        for s in range(instance.S):
+            if x0_prev[n, s]:
+                loads += instance.A[0, n, s, :] * y0_aug[n, s]
+    for m in range(instance.M):
+        for n in range(instance.N):
+            for s in range(instance.S):
+                if xmns_prev[m, n, s]:
+                    loads += instance.A[m + 1, n, s, :] * ymn_aug[m, n, s]
+
+    tau_cost = np.zeros((instance.M + 1, instance.N, instance.S), dtype=float)
+    for n in range(instance.N):
+        for s in range(instance.S):
+            tau_cost[0, n, s] = flow_delay(
+                instance,
+                0,
+                n,
+                s,
+                max(pub_caps[n, s], DEFAULT_RATE_EPS),
+                loads,
+                tau3,
+            )
+    for m in range(instance.M):
+        for n in range(instance.N):
+            for s in range(instance.S):
+                tau_cost[m + 1, n, s] = flow_delay(
+                    instance,
+                    m + 1,
+                    n,
+                    s,
+                    max(ymn_aug[m, n, s], DEFAULT_RATE_EPS),
+                    loads,
+                    tau3,
+                )
+    return tau_cost
+
+
+def solve_data_placement(instance, tau_cost):
+    """Greedy lower-level solver inspired by the facility-location step.
+
+    For each object, repeatedly open the server/cluster with the best
+    average cost (publisher placement cost + client connection costs).
     """
-    y0 = np.where(y0_ref > ymn_min * 0.5, y0_ref, ymn_min)
+    x0 = np.zeros((instance.N, instance.S), dtype=int)
+    xmns = np.zeros((instance.M, instance.N, instance.S), dtype=int)
 
-    alpha = np.zeros((M, N, S))
-    beta  = np.zeros(L)
+    for n in range(instance.N):
+        unassigned = list(range(instance.M))
+        opened = set()
 
-    LB = -np.inf
-    UB =  np.inf
-    best_x0   = None
-    best_xmns = None
+        while unassigned:
+            best_ratio = float("inf")
+            best_server = None
+            best_cluster = None
 
-    for _t in range(max_iter):
+            for s in range(instance.S):
+                sorted_clients = sorted(unassigned, key=lambda m: tau_cost[m + 1, n, s])
+                placement_cost = 0.0 if s in opened else tau_cost[0, n, s]
 
-        # ── Knapsack per server: which objects to cache? (eq. 10) ──────────
-        x0 = np.zeros((N, S), dtype=int)
-        for s in range(S):
-            vals = np.array([
-                sum(alpha[m, n, s] for m in range(M))
-                - np.dot(kl, a[0, n, s, :]) * y0[n, s]
-                - dns[n, s]
-                - ymn_min * np.dot(beta, a[0, n, s, :])
-                for n in range(N)
-            ])
-            x0[:, s] = _knapsack(vals, bn, Bs[s])
+                for k in range(1, len(sorted_clients) + 1):
+                    cluster = sorted_clients[:k]
+                    ratio = (
+                        placement_cost
+                        + sum(tau_cost[m + 1, n, s] for m in cluster)
+                    ) / k
+                    if ratio < best_ratio:
+                        best_ratio = ratio
+                        best_server = s
+                        best_cluster = cluster
 
-        x0 = _capacity_aware_enforce(x0, y0)   # Bug 1 fix
+            x0[n, best_server] = 1
+            opened.add(best_server)
+            for m in best_cluster:
+                xmns[m, n, best_server] = 1
+                unassigned.remove(m)
 
-        # ── Assignment per (m,n) ────────────────────────────────────────────
-        xmns = np.zeros((M, N, S), dtype=int)
-        for m in range(M):
-            for n in range(N):
-                available = [s for s in range(S) if x0[n, s]] or list(range(S))
-                costs = {
-                    s: (np.dot(kl, a[m+1, n, s, :]) * ymn_ref[m, n]
-                        + alpha[m, n, s]
-                        + ymn_min * np.dot(beta, a[m+1, n, s, :]))
-                    for s in available
-                }
-                xmns[m, n, min(costs, key=costs.get)] = 1
+    return x0, xmns
 
-        # ── Lagrangian value L(x̃, α, β) ────────────────────────────────────
-        L_val = (H(x0)
-                 + sum(np.dot(kl, a[0, n, s, :]) * x0[n, s] * y0[n, s]
-                       for n in range(N) for s in range(S))
-                 + sum(np.dot(kl, a[m+1, n, s, :]) * xmns[m, n, s] * ymn_ref[m, n]
-                       for m in range(M) for n in range(N) for s in range(S))
-                 + sum(alpha[m, n, s] * (xmns[m, n, s] - x0[n, s])
-                       for m in range(M) for n in range(N) for s in range(S))
-                 + sum(beta[l] * (
-                       sum(x0[n, s] * a[0, n, s, l] * ymn_min
-                           + sum(xmns[m, n, s] * a[m+1, n, s, l] * ymn_min
-                                 for m in range(M))
-                           for n in range(N) for s in range(S)) - Cl[l])
-                   for l in range(L)))
 
-        # ── Update bounds (Algorithm 1, steps 3–4) ─────────────────────────
-        feasible = is_feasible(x0, xmns)
-        if feasible:
-            if L_val > LB:
-                LB = L_val
-                best_x0   = x0.copy()
-                best_xmns = xmns.copy()
-            primal = G(x0, xmns, y0, ymn_ref) + H(x0)
-            if primal < UB:
-                UB = primal
+def solve_instance(
+    instance,
+    tau3=DEFAULT_TAU3,
+    rate_eps=DEFAULT_RATE_EPS,
+    queue_eps=DEFAULT_QUEUE_EPS,
+    max_outer_iter=DEFAULT_MAX_OUTER_ITER,
+    verbose=False,
+):
+    """Run the centralized two-level heuristic from Section 3."""
+    pub_caps, cli_caps = build_route_caps(instance)
+    x0, xmns = initial_assignment(instance)
 
-        if UB == np.inf:
-            UB = max(abs(L_val) * 1.1, 1.0)
+    best_q = float("inf")
+    best_solution = None
+    history = []
+    seen_states = set()
 
-        gap = UB - LB
-        if LB > -np.inf and gap < eps * max(1.0, abs(LB)):
+    for iteration in range(1, max_outer_iter + 1):
+        state_key = (tuple(x0.reshape(-1).tolist()), tuple(xmns.reshape(-1).tolist()))
+        if state_key in seen_states:
             break
+        seen_states.add(state_key)
 
-        # ── Subgradient ascent on dual (Algorithm 1, step 5) ───────────────
-        D_alpha = (xmns - x0[np.newaxis, :, :]).astype(float)
-        D_beta  = np.array([
-            sum(x0[n, s] * a[0, n, s, l] * ymn_min
-                + sum(xmns[m, n, s] * a[m+1, n, s, l] * ymn_min
-                      for m in range(M))
-                for n in range(N) for s in range(S)) - Cl[l]
-            for l in range(L)
-        ])
+        y0, ymn, q_val, converged = solve_rate_allocation(
+            instance,
+            x0,
+            xmns,
+            pub_caps,
+            cli_caps,
+            tau3=tau3,
+            rate_eps=rate_eps,
+            queue_eps=queue_eps,
+        )
 
-        norm_a2 = np.sum(D_alpha ** 2)
-        norm_b2 = np.sum(D_beta  ** 2)
-        if norm_a2 > 1e-14:
-            alpha = np.maximum(0.0, alpha + kappa * gap / norm_a2 * D_alpha)
-        if norm_b2 > 1e-14:
-            beta  = np.maximum(0.0, beta  + kappa * gap / norm_b2 * D_beta)
+        history.append(
+            {
+                "iteration": iteration,
+                "objective": q_val,
+                "rate_converged": converged,
+            }
+        )
 
-    if best_x0 is None:
-        best_x0   = x0
-        best_xmns = _greedy_assign(x0)
+        if verbose and not converged:
+            print(f"[Iteration {iteration}] upper-level solver may not have converged.")
 
-    return best_x0, best_xmns
+        if q_val < best_q:
+            best_q = q_val
+            best_solution = (x0.copy(), xmns.copy(), y0.copy(), ymn.copy())
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# INITIALISATION  (Section III-C)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def initial_placement():
-    """
-    Greedy capacity-aware placement at minimum rates (Section III-C).
-    Used to obtain a feasible starting point before the first upper-level solve.
-    """
-    x0   = np.zeros((N, S), dtype=int)
-    used = np.zeros(S)
-    for n in range(N):
-        candidates = [
-            (dns[n, s] + np.dot(kl, a[0, n, s, :]) * ymn_min, s)
-            for s in range(S) if used[s] + bn[n] <= Bs[s]
-        ]
-        if not candidates:
-            candidates = [(dns[n, s], s) for s in range(S)]
-        _, best_s = min(candidates)
-        x0[n, best_s] = 1
-        used[best_s] += bn[n]
-    return x0
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TWO-LEVEL HEURISTIC  (Section III)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def two_level_heuristic(max_outer_iter=10):
-    print("=" * 62)
-    print("  Two-Level CAN Heuristic  —  Gąsior & Drwal (2012)")
-    print("=" * 62)
-
-    print("\n[Init] Greedy placement at minimum rates...")
-    x0   = initial_placement()
-    xmns = _greedy_assign(x0)
-    print(f"[Init] x0:\n{x0}")
-    print(f"[Init] Feasible: {is_feasible(x0, xmns)}")
-
-    best_Q   = -np.inf
-    best_sol = None
-
-    for it in range(1, max_outer_iter + 1):
-        print(f"\n{'─'*62}\n  Iteration {it}\n{'─'*62}")
-
-        # Upper level
-        y0, ymn, obj_val, ok = solve_rate_allocation(x0, xmns)
-        if not ok:
-            print("  [!] Rate solver may not have fully converged.")
-
-        Q = Q_profit(x0, xmns, y0, ymn)
-        print(f"  [Upper] Q = {Q:.4f}   (rate-obj = {obj_val:.4f})")
-        print(f"  [Upper] Publisher rates y0[n,s]:")
-        for n in range(N):
-            for s in range(S):
-                if y0[n, s] > ymn_min * 0.5:
-                    print(f"           Object {n+1} → Server {s+1}: {y0[n,s]:.4f}")
-        print(f"  [Upper] Client rates ŷ[m,n]:")
-        for m in range(M):
-            for n in range(N):
-                print(f"           Client {m+1} Object {n+1}: {ymn[m,n]:.4f}")
-
-        if Q <= best_Q:
-            print(f"\n  [Stop] Q did not improve ({Q:.4f} ≤ {best_Q:.4f}). Converged.")
-            break
-
-        best_Q   = Q
-        best_sol = (x0.copy(), xmns.copy(), y0.copy(), ymn.copy())
-
-        # Lower level
-        x0_new, xmns_new = solve_data_placement(y0, ymn)
-        replication = [(n+1, s+1) for n in range(N) for s in range(S) if x0_new[n,s]]
-        print(f"  [Lower] New x0:\n{x0_new}  →  objects cached: {replication}")
-        print(f"  [Lower] Feasible: {is_feasible(x0_new, xmns_new)}")
+        tau_cost = build_tau_cost(
+            instance,
+            (x0, xmns),
+            y0,
+            ymn,
+            pub_caps,
+            cli_caps,
+            tau3,
+        )
+        x0_new, xmns_new = solve_data_placement(instance, tau_cost)
 
         if np.array_equal(x0_new, x0) and np.array_equal(xmns_new, xmns):
-            print("  [Stop] Placement unchanged. Converged.")
             break
 
         x0, xmns = x0_new, xmns_new
 
-    if best_sol is None:
-        best_sol = (x0, xmns, np.full((N,S), ymn_min), np.full((M,N), ymn_min))
+    if best_solution is None:
+        raise RuntimeError("Heuristic failed to produce a solution.")
 
-    x0b, xb, y0b, yb = best_sol
+    x0_best, xmns_best, y0_best, ymn_best = best_solution
+    loads = active_link_loads(instance, x0_best, xmns_best, y0_best, ymn_best)
 
-    print(f"\n{'='*62}")
-    print(f"  FINAL SOLUTION   Q = {best_Q:.4f}")
-    print(f"{'='*62}")
+    placement = {}
+    publisher_rates = {}
+    assignments = {}
+    client_rates = {}
+    aggregated_rates = {"pub": {}, "clients": {}}
+    link_stats = {}
 
-    print("\nObject placement (x0):")
-    for n in range(N):
-        srvs = [f"Server {s+1}" for s in range(S) if x0b[n,s]]
-        print(f"  Object {n+1} → {', '.join(srvs)}")
+    for n in range(instance.N):
+        placed = [s for s in range(instance.S) if x0_best[n, s]]
+        placement[n] = placed
+        publisher_rates[n] = {s: float(y0_best[n, s]) for s in placed}
+        aggregated_rates["pub"][n] = float(sum(y0_best[n, s] for s in placed))
 
-    print("\nClient-server assignments:")
-    for m in range(M):
-        for n in range(N):
-            for s in range(S):
-                if xb[m,n,s]:
-                    print(f"  Client {m+1} reads Object {n+1} from Server {s+1}")
+    for m in range(instance.M):
+        aggregated_rates["clients"][m] = {}
+        for n in range(instance.N):
+            chosen = next(s for s in range(instance.S) if xmns_best[m, n, s])
+            assignments[m, n] = chosen
+            client_rates[m, n] = float(ymn_best[m, n])
+            aggregated_rates["clients"][m][n] = float(ymn_best[m, n])
 
-    print("\nPublisher upload rates:")
-    for n in range(N):
-        for s in range(S):
-            if x0b[n,s]:
-                print(f"  y0[{n+1},{s+1}] = {y0b[n,s]:.4f}")
+    for l in range(instance.L):
+        link_stats[l] = {
+            "load": float(loads[l]),
+            "capacity": float(instance.Cl[l]),
+            "utilization": float(loads[l] / instance.Cl[l]),
+            "queue_delay": float(1.0 / (instance.Cl[l] - loads[l])),
+            "tau3": float(tau3),
+        }
 
-    print("\nClient download rates:")
-    for m in range(M):
-        for n in range(N):
-            print(f"  ŷ[{m+1},{n+1}] = {yb[m,n]:.4f}")
+    return {
+        "objective_delay": float(best_q),
+        "placement": placement,
+        "publisher_rates": publisher_rates,
+        "assignments": assignments,
+        "client_rates": client_rates,
+        "aggregated_rates": aggregated_rates,
+        "link_stats": link_stats,
+        "iteration_history": history,
+        "instance_shape": {
+            "M": instance.M,
+            "N": instance.N,
+            "S": instance.S,
+            "L": instance.L,
+        },
+        "bn": instance.bn.tolist(),
+        "Cl": instance.Cl.tolist(),
+        "tau3": float(tau3),
+    }
 
-    print("\nLink utilisation:")
-    for l in range(L):
-        load = (sum(a[0,n,s,l]*x0b[n,s]*y0b[n,s]   for n in range(N) for s in range(S))
-              + sum(a[m+1,n,s,l]*xb[m,n,s]*yb[m,n]
-                   for m in range(M) for n in range(N) for s in range(S)))
-        print(f"  Link {l+1} (cost={kl[l]:.0f}/unit): {load:.4f} / {Cl[l]:.1f}")
 
-    print(f"\nStorage cost H(x0) = {H(x0b):.4f}")
-    print(f"\nPaper Table II ref:   Q ≈ 73.7  (optimal, found in iteration 1)")
+def solve_file(
+    instance_path,
+    tau3=DEFAULT_TAU3,
+    rate_eps=DEFAULT_RATE_EPS,
+    queue_eps=DEFAULT_QUEUE_EPS,
+    max_outer_iter=DEFAULT_MAX_OUTER_ITER,
+    verbose=False,
+):
+    """Load a JSON instance and run the heuristic."""
+    instance = ModelReader.load_input_data(instance_path)
+    return solve_instance(
+        instance,
+        tau3=tau3,
+        rate_eps=rate_eps,
+        queue_eps=queue_eps,
+        max_outer_iter=max_outer_iter,
+        verbose=verbose,
+    )
 
-    return x0b, xb, y0b, yb, best_Q
+
+def print_solution_report(result):
+    """Pretty-print the numeric result dictionary returned by solve_file()."""
+    shape = result["instance_shape"]
+    print("=== Instance ===")
+    print(f"  M={shape['M']}  N={shape['N']}  S={shape['S']}  L={shape['L']}")
+    print(f"  b_n     = {result['bn']}")
+    print(f"  C_l     = {result['Cl']}")
+    print(f"  tau3    = {result['tau3']}")
+
+    print("\n" + "=" * 64)
+    print(f"  FINAL HEURISTIC DELAY Q = {result['objective_delay']:.5f}")
+    print("=" * 64)
+
+    print("\n-- Placement --")
+    for n, placed in result["placement"].items():
+        print(f"  object {n} on server(s) {placed}")
+        for s, rate in result["publisher_rates"][n].items():
+            print(f"     upload rate y0[{n},{s}] = {rate:.4f}")
+
+    print("\n-- Client assignments --")
+    for (m, n), s in result["assignments"].items():
+        rate = result["client_rates"][m, n]
+        print(f"  client {m} <- server {s} for object {n} rate {rate:.4f}")
+
+    print("\n-- Aggregated transmission rates y_mn --")
+    print(f"  {'m':>4}  {'n':>3}  {'y_mn':>8}")
+    for n, rate in result["aggregated_rates"]["pub"].items():
+        print(f"  {'pub':>4}  {n:>3}  {rate:>8.4f}")
+    for m, by_object in result["aggregated_rates"]["clients"].items():
+        for n, rate in by_object.items():
+            print(f"  {m:>4}  {n:>3}  {rate:>8.4f}")
+
+    print("\n-- Links --")
+    print(f"  {'l':>2} {'load':>8} {'cap':>6} {'util':>7} {'queue':>10} {'tau3':>8}")
+    for l, stats in result["link_stats"].items():
+        print(
+            f"  {l:>2} {stats['load']:>8.3f} {stats['capacity']:>6.1f} "
+            f"{100 * stats['utilization']:>6.1f}% {stats['queue_delay']:>10.5f} {stats['tau3']:>8.4f}"
+        )
+
+    print("\n-- Iterations --")
+    for item in result["iteration_history"]:
+        print(
+            f"  iter {item['iteration']:>2}: objective={item['objective']:.5f}, "
+            f"rate_ok={item['rate_converged']}"
+        )
+
+
+def build_arg_parser():
+    """Create the CLI parser used by main()."""
+    parser = argparse.ArgumentParser(
+        description="Run the Section-3 CAN heuristic for a JSON instance file.",
+        epilog="Example: uv run python projekt/can_heuristic.py projekt/data/data1.json",
+    )
+    parser.add_argument("instance_path", help="Path to the input JSON instance file.")
+    parser.add_argument(
+        "--tau3",
+        type=float,
+        default=DEFAULT_TAU3,
+        help=f"Constant per-link delay term. Default: {DEFAULT_TAU3}.",
+    )
+    parser.add_argument(
+        "--rate-eps",
+        type=float,
+        default=DEFAULT_RATE_EPS,
+        help=f"Minimum active-flow rate. Default: {DEFAULT_RATE_EPS}.",
+    )
+    parser.add_argument(
+        "--queue-eps",
+        type=float,
+        default=DEFAULT_QUEUE_EPS,
+        help=f"Minimum residual link capacity. Default: {DEFAULT_QUEUE_EPS}.",
+    )
+    parser.add_argument(
+        "--max-outer-iter",
+        type=int,
+        default=DEFAULT_MAX_OUTER_ITER,
+        help=f"Maximum number of outer heuristic iterations. Default: {DEFAULT_MAX_OUTER_ITER}.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print extra convergence messages while running.",
+    )
+    return parser
+
+
+def main(argv=None):
+    """CLI entrypoint: read an instance path, solve, and print the report."""
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    result = solve_file(
+        args.instance_path,
+        tau3=args.tau3,
+        rate_eps=args.rate_eps,
+        queue_eps=args.queue_eps,
+        max_outer_iter=args.max_outer_iter,
+        verbose=args.verbose,
+    )
+    print_solution_report(result)
+    return 0
 
 
 if __name__ == "__main__":
-    two_level_heuristic()
+    raise SystemExit(main())
