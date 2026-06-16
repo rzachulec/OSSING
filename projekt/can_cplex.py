@@ -14,6 +14,7 @@ import argparse
 
 import numpy as np
 from docplex.mp.model import Model
+from time import perf_counter
 
 try:
     from . import ModelReader
@@ -475,10 +476,17 @@ def solve_instance(
 ):
     """Solve an already loaded instance and return plain numeric results."""
     refs = build_model(instance, tau3=tau3, rate_eps=rate_eps, queue_eps=queue_eps)
+
+    t0 = perf_counter()
     sol = refs["mdl"].solve(log_output=log_output)
+    solve_time_s = perf_counter() - t0
+
     if not sol:
         raise RuntimeError(f"No solution found. Status: {refs['mdl'].solve_status}")
-    return extract_solution(instance, refs)
+
+    result = extract_solution(instance, refs)
+    result["solve_time_s"] = solve_time_s
+    return result
 
 
 def solve_file(

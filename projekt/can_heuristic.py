@@ -17,6 +17,7 @@ import argparse
 
 import numpy as np
 import scipy.optimize as opt
+from time import perf_counter
 
 try:
     from . import ModelReader
@@ -333,12 +334,15 @@ def solve_instance(
     history = []
     seen_states = set()
 
+    heuristic_t0 = perf_counter()
+    rate_solve_time_total = 0.0
     for iteration in range(1, max_outer_iter + 1):
         state_key = (tuple(x0.reshape(-1).tolist()), tuple(xmns.reshape(-1).tolist()))
         if state_key in seen_states:
             break
         seen_states.add(state_key)
 
+        rate_t0 = perf_counter()
         y0, ymn, q_val, converged = solve_rate_allocation(
             instance,
             x0,
@@ -349,6 +353,8 @@ def solve_instance(
             rate_eps=rate_eps,
             queue_eps=queue_eps,
         )
+        rate_time = perf_counter() - rate_t0
+        rate_solve_time_total += rate_time
 
         history.append(
             {
@@ -417,6 +423,7 @@ def solve_instance(
             "tau3": float(tau3),
         }
 
+    heuristic_time_s = perf_counter() - heuristic_t0
     return {
         "objective_delay": float(best_q),
         "placement": placement,
@@ -435,6 +442,8 @@ def solve_instance(
         "bn": instance.bn.tolist(),
         "Cl": instance.Cl.tolist(),
         "tau3": float(tau3),
+        "solve_time_s": heuristic_time_s,
+        "rate_solve_time_s": rate_solve_time_total,
     }
 
 
@@ -497,6 +506,10 @@ def print_solution_report(result):
             f"  {l:>2} {stats['load']:>8.3f} {stats['capacity']:>6.1f} "
             f"{100 * stats['utilization']:>6.1f}% {stats['queue_delay']:>10.5f} {stats['tau3']:>8.4f}"
         )
+
+    print("\n-- Timing --")
+    print(f"  Total heuristic time : {result['solve_time_s']:.4f} s")
+    print(f"  SLSQP solve time     : {result['rate_solve_time_s']:.4f} s")
 
     print("\n-- Iterations --")
     for item in result["iteration_history"]:
