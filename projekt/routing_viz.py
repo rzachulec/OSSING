@@ -23,7 +23,7 @@ from __future__ import annotations
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.patches import FancyBboxPatchs
+from matplotlib.patches import FancyBboxPatch
 
 try:
     from . import ModelReader

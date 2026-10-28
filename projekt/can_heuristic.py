@@ -14,6 +14,7 @@ The implementation follows the shared project conventions:
 from __future__ import annotations
 
 import argparse
+import os
 
 import numpy as np
 import scipy.optimize as opt
@@ -562,8 +563,9 @@ def main(argv=None):
     """CLI entrypoint: read an instance path, solve, and print the report."""
     parser = build_arg_parser()
     args = parser.parse_args(argv)
-    result = solve_file(
-        args.instance_path,
+    instance = ModelReader.load_input_data(args.instance_path)
+    result = solve_instance(
+        instance,
         tau3=args.tau3,
         rate_eps=args.rate_eps,
         queue_eps=args.queue_eps,
@@ -571,6 +573,17 @@ def main(argv=None):
         verbose=args.verbose,
     )
     print_solution_report(result)
+    try:
+        from .solution_viz import render_result
+    except ImportError:
+        from solution_viz import render_result
+    render_result(
+        result,
+        instance.A,
+        name=os.path.basename(args.instance_path),
+        show=True,
+        save_path="solution.png",
+    )
     return 0
 
 
